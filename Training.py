@@ -26,7 +26,7 @@ db = client['ML_data']
 model_collection = db['model_data']  # Collection to store model parameters
 stats_collection = db['stats']  # Collection to store training stats
 task_queue = Queue()
-
+results_dict = {}
 
 class UploadParameters(Resource):
     def post(self):
@@ -50,9 +50,9 @@ def start_training(data):
     train_dataset_path = data.get('train_dataset')
     parameters_data = model_collection.find_one({"user_id": user_id, "project_id": project_id})
     parameters = parameters_data['parameters']
-   # train_dataset_path = parameters['train_dataset']
+    # train_dataset_path = parameters['train_dataset']
     # api_dataset = load_from_disk(train_dataset_path)
-    api_dataset = load_dataset('parquet', data_files= train_dataset_path)
+    api_dataset = load_dataset('parquet', data_files=train_dataset_path)
 
     api_dataset = api_dataset["train"].train_test_split(test_size=0.2)
     # Check if 'labels' is in features
@@ -100,6 +100,7 @@ def start_training(data):
 
     # eval_dataset = load_dataset('parquet', data_files='/home/thai/training_test/validation-00000-of-00003.parquet')
     # load training arguments
+    model_saved_path = f'./{user_id}/{project_id}/model'
     training_args = TrainingArguments(
         output_dir=f'./results/{user_id}/{project_id}',
         num_train_epochs=parameters.get('num_train_epochs'),
@@ -122,7 +123,8 @@ def start_training(data):
         data_collator=data_collator,
         train_dataset=api_dataset["train"],
         eval_dataset=api_dataset["test"],
-        tokenizer=feature_extractor
+        tokenizer=feature_extractor,
+        compute_metrics=compute_metrics
     )
     try:
         trainer.train()
@@ -131,20 +133,26 @@ def start_training(data):
         return {"message": "Training failed"}, 400
 
     # Save training stats to the database
+    trainer.save_model(model_saved_path)
+    absolute_model_path = os.path.abspath(model_saved_path)
     stats_collection.insert_one({
         'user_id': user_id,
         'project_id': project_id,
         'model_name': model_name,
-        'training_stats': trainer.evaluate()
+        'training_stats': trainer.evaluate(),
+        'model_saved_path': absolute_model_path
     })
 
     return {"message": f"Training for model {model_name} completed successfully"}, 200
 
 
-def worker():
+def worker(request_id):
     while not task_queue.empty():
         data = task_queue.get()
-        start_training(data)
+       # start_training(data)
+        result, status_code = start_training(data)
+       # print(result)
+        results_dict[request_id] = (result, status_code)
         task_queue.task_done()
     task_complete_event.set()
 
@@ -152,36 +160,25 @@ def worker():
 class StartTraining(Resource):
     def post(self):
         data = request.get_json()
-        task_queue.put(data)
-        task_complete_event.clear()
-        worker_thread = Thread(target=worker)
-        worker_thread.start()
-
-        task_complete_event.wait()
-        return {"message": "Training request received"}, 200
-
-
-class GetTrainingStats(Resource):
-    def get(self):
-        data = request.get_json()
         user_id = data.get('user_id')
         project_id = data.get('project_id')
-        model_name = data.get('model_name')
-        stats = stats_collection.find_one({
-            'user_id': user_id,
-            'project_id': project_id,
-            'model_name': model_name
-        })
-
-        if stats:
-            return stats['training_stats'], 200
+        request_id = f"{user_id}_{project_id}"
+        task_queue.put(data)
+        task_complete_event.clear()
+        worker_thread = Thread(target=worker,args=(request_id,))
+        worker_thread.start()
+        worker_thread.join()
+        #task_complete_event.wait()
+        if request_id in results_dict:
+            result, status_code = results_dict.pop(request_id)
+            return result, status_code
         else:
-            return {"message": "No training stats found"}, 404
+            return {"message": "Error occurred during inference"}, 500
+        #return {"message": "Training request received"}, 200
 
 
 api.add_resource(UploadParameters, '/upload_parameters')
 api.add_resource(StartTraining, '/start_training')
-api.add_resource(GetTrainingStats, '/get_training_stats')
 
 if __name__ == '__main__':
     app.run(debug=True)
